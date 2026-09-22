@@ -1,7 +1,7 @@
 # MuseTalk Lip-Sync Avatar Pipeline (Modal A100) — Project Summary
 
 > Ye document simple Hinglish mein likha hai. Jahan technical baat aayi hai, wahan roz-marra ka example diya hai.
-> Last update: 2026-09-22. Status: **do parts ban chuke hain.** (A) Section 1-8: MuseTalk lip-sync GPU service (Modal), end-to-end tested — 60 sec ka clip 1500/1500 frames, 0 skipped, 0 late, ~45-48 fps warm. (B) Section 9: **poori interview application** (`interview-poc/`) — apna backend (Deepgram STT + OpenAI LLM/TTS, dono streamed) + browser frontend, jo is GPU service ko consume karta hai. README.md mein English overview hai, ye file poori dev-history aur numbers ke liye hai.
+> Last update: 2026-09-21. Status: **end-to-end kaam kar raha hai. Asli Modal server pe 60 sec ka clip awaaz ke saath fixed 25 fps pe chala: 1500/1500 frames, 0 skipped, 0 late.** Server warm hone pe ~45-48 fps banata hai (real-time ka ~2x). Baaki: cold start (~40 s), pehle frame ki delay (audio upload + US-West ka network), aur deploy + auth.
 
 ---
 
@@ -105,9 +105,6 @@ Server frames **playback se tez** bhejta hai (~45 fps). Agar client unhe "jaise 
 | `test.py` | Sabse pehla GPU sanity test. |
 | `sample.mp4` | Avatar video (isme awaaz nahi hai). |
 | `test_audio.wav`, `test_output.mp4` | Test audio (60 sec) aur uska bana hua output. |
-| `.gitignore` | Root-level, poore project (dono parts) ke liye — `venv/`, `__pycache__/`, `.env` (par `.env.example` nahi), test artifacts. |
-| `README.md` | English mein poora project overview, setup, aur run instructions — naye/bahar ke reader ke liye. |
-| `interview-poc/` | **Poori interview application** (backend + frontend) jo is GPU service ko use karti hai — poori detail **Section 9** mein. |
 
 > Note: player `tools/` mein hai. Kuch testing scripts abhi temporary folder mein hain, project mein save nahi hain: network bandwidth diagnostic (`bw_server.py`, `bw_client.py`), blend ka equivalence test, aur local mock server (jisse player bina GPU kharch ke test hua).
 
@@ -345,11 +342,10 @@ Warm-up (cold) request, 10 s audio: pehla packet **41 s** baad aaya, lekin playb
 
 ### Priority 4 — Client side (interview app)
 
-- ✅ **Browser mein ho gaya** (`interview-poc/frontend/app.js`, Section 9 dekho) — 25 fps fixed pace, audio master clock, hold/skip, sab kuch.
-- ✅ **MediaSource Extensions ki jagah WebCodecs use kiya** — MSE ko fragmented-MP4 chahiye hota hai, humara Annex-B H.264 seedha `VideoDecoder` mein chala gaya, extra muxing ki zaroorat nahi padi.
-- ✅ **TTS text-based ban gaya, audio WAV upload nahi karna padta** — candidate ka jawab hi audio hai (STT ke liye), lekin **interviewer ka sawal ab text se TTS-generate hota hai backend mein**, browser ko WAV upload nahi karna padta us taraf. Ye Priority 4 ke "TTS cloud mein rakho" wale point ko already satisfy karta hai.
-- Stall pe avatar ka "idle loop" dikhana taaki video freeze na lage — abhi nahi kiya.
-- Candidate ke jawab ka audio (WAV, browser se backend) abhi bhi bada hai — Opus/MP3 mein compress karna baaki hai.
+- ✅ (test client mein ho gaya) Audio client pe bajana, frames **25 fps ke fixed pace** pe dikhana, chhota jitter buffer (0.5 s), audio master clock. Frame late ho to last frame hold, peeche reh jaye to frames skip. Ab interview app ke browser mein bhi yahi logic lagana hai.
+- Video chunks ko browser mein **MediaSource Extensions** se chalana.
+- Stall pe avatar ka "idle loop" dikhana taaki video freeze na lage.
+- Audio upload chhota karna: WAV bhari hai (10 s = 320 KB, 60 s = 1.92 MB). Slow link pe 60 s ka clip pehle frame ko ~8 s late karta hai. Opus/MP3 mein bhejne se ~10x chhota hoga. **Ya better:** TTS (text-to-speech) ko GPU ke saath cloud mein hi rakho aur app sirf text bheje, to audio slow link se guzre hi nahi.
 
 ### Priority 5 — Production tayari
 
@@ -484,136 +480,3 @@ Isse URL mein `-dev` nahi hoga aur service hamesha available rahegi. **Isse pehl
 ## 8. Ek line mein poori kahani
 
 Pipeline **end-to-end kaam karta hai:** audio jata hai, lip-synced avatar video H.264 mein aata hai, aur player use **25 fps pe awaaz ke saath** chalata hai. Asli server pe 60 s ka clip 1500/1500 frames, 0 skipped, 0 late ke saath chala. Server warm hone pe ~45-48 fps banata hai (real-time ka ~2x), bandwidth 15.9 → 0.82 Mbps ho gayi, aur blend 8x tez hua (bit-exact). **Baaki kaam:** (1) **cold start** hatana (pehli request pe ~40 s), (2) **pehle frame ki delay** kam karna (audio upload + 350 ms RTT ki wajah se, server ki wajah se nahi), (3) **server ko India ke paas rakhna** (`ap-south`, A100 availability check karni hai), (4) **deploy + auth** aur interview app (browser) ke saath integration.
-
-*(Ye Part A — GPU lip-sync service — ka summary hai. Part B — poori interview application — Section 9 mein hai.)*
-
----
-
-## 9. Interview POC Application (Part B — `interview-poc/`)
-
-Ye ek **bilkul alag application** hai jo upar wale GPU service ko **use** karti hai — candidate se baat karti hai, sawal-jawab chalati hai. `avatar gpu test` folder ke andar hi (bahar kuch nahi), apna alag `venv` aur apna alag `.env`.
-
-### 9.1 Goal aur pieces
-
-Candidate interview de raha hai. Interviewer **AI hai** — sawal poochta hai (avatar bolta hua dikhta hai), candidate jawab deta hai (mic se), aur system agla sawal khud banata hai jawab ke hisaab se.
-
-| Piece | Kaam | Service |
-|---|---|---|
-| **STT** (Speech-to-Text) | Candidate ki awaaz ko text mein badalna | Deepgram |
-| **LLM** | Agla sawal banana (conversation history dekh ke) | OpenAI |
-| **TTS** (Text-to-Speech) | Sawal ke text ko awaaz mein badalna | OpenAI |
-| **Lip-sync** | Awaaz ko avatar ke hoth se sync karna | Hamara Modal service (Part A) |
-
-### 9.2 Architecture
-
-```
-Browser                          interview-poc/backend                 Modal (Part A)
-(candidate ki screen)            (FastAPI, apna WebSocket)              (GPU service)
-     │                                    │                                  │
-     │ 1) mic se jawab record ──────────► │                                  │
-     │    (button dabane tak)             │ 2) Deepgram: audio -> text       │
-     │                                    │ 3) OpenAI LLM: agla sawal        │
-     │                                    │    (STREAMED, sentence-by-       │
-     │                                    │    sentence — Section 9.4)       │
-     │ ◄── text turant (per sentence) ────│                                  │
-     │                                    │ 4) OpenAI TTS: sentence -> audio │
-     │                                    │    (STREAMED)                    │
-     │                                    │ 5) audio ─────────────────────►  │
-     │                                    │                                  │ 6) lip-sync
-     │                                    │ ◄────── H.264 frames (streamed) ─│    frames
-     │ ◄── audio + video frames ──────────│                                  │
-     │                                    │                                  │
-     │ 7) text+audio+video EK SAATH       │                                  │
-     │    reveal, 25fps pe play           │                                  │
-     │                                    │                                  │
-     │ 8) agla sentence bhi isi tarah, phir agla, jab tak jawab poora na ho  │
-```
-
-**Example:** Backend ek **waiter** hai — STT/LLM/TTS/Modal (kitchen) se order leke browser (customer) ko turant serve karta hai, khud khana nahi banata.
-
-### 9.3 Files
-
-| File | Kaam |
-|---|---|
-| `backend/server.py` | Browser ke liye apna WebSocket (`/session`) + frontend static files serve karta hai |
-| `backend/session.py` | Poora orchestration: STT → LLM (streamed) → per-sentence TTS+Modal → relay |
-| `backend/stt.py` | Deepgram (prerecorded/batch REST API — push-to-talk hai, poora audio ek baar mein hi jata hai) |
-| `backend/llm.py` | OpenAI chat, **streamed**, sentence-boundary pe split (Section 9.4) |
-| `backend/tts.py` | OpenAI TTS, **streamed audio output** |
-| `backend/modal_client.py` | Modal ke `/ws-stream` se **ek persistent connection**, poore interview session mein reuse (Modal ka container bhi warm rehta hai) |
-| `backend/config.py` | `.env` load karta hai |
-| `backend/.env` / `.env.example` | API keys (`.env` gitignored hai) |
-| `frontend/index.html`, `style.css` | Basic UI: avatar canvas, question/answer text, loading overlay, processing spinner, buttons |
-| `frontend/app.js` | WebSocket client, mic recording, **WebCodecs** se H.264 decode, **Web Audio API** se audio-clock playback — Python player (`tools/ws_h264_view.py`) ka hi JS version |
-
-### 9.4 Streaming: LLM → TTS → Modal
-
-Pehle poocha gaya tha ki LLM ka response TTS ko, aur TTS ka audio Modal ko **stream** kaise karein. Isko test karne se pehle technical reality check ki:
-
-- **OpenAI TTS incremental text accept nahi karta** — ek call mein poora text dena padta hai, sirf **audio output stream** ho sakta hai (poore file ka wait nahi, chunks mein milta hai).
-- Isliye asli streaming unit **sentence** hai, token nahi. Jaise hi LLM ek sentence poora kar leta hai, wahi sentence TTS aur Modal ko bhej dete hain, jabki LLM agle sentence pe kaam karta rehta hai.
-
-**Pipelining:** Jab sentence 1 Modal se lip-sync ho raha hota hai, **sentence 2 ka LLM+TTS backend mein already background mein chal raha hota hai** (`asyncio.create_task`). Jab tak Modal sentence 1 khatam kare, sentence 2 ka audio pehle se hi taiyar mil jata hai.
-
-**Example:** Ek chef poora 3-course menu likhne ka wait nahi karta serve karne se pehle — pehla course jaise hi ready hota hai serve kar deta hai, jabki doosre course pe kaam chalu rehta hai.
-
-**Ek bug pakड़ा khud test karte waqt** (fake data se, bina API call kiye): agar LLM ka jawab **exactly sentence boundary pe khatam ho** (jo normal hai), to naive logic mein `is_final=True` kabhi milta hi nahi — end of stream pe pata nahi chalta ki last sentence hi final tha. Fix: "lookahead" pattern — jab tak agla sentence na mil jaye (ya stream khatam na ho jaye), pichla sentence hold karke rakhte hain, tabhi pata chalta hai wo final tha ya nahi. 5 edge cases se test kiya (boundary pe khatam, trailing text, single sentence, token-by-token, empty) — sab pass.
-
-**Frontend pe bhi badlav zaroori hua:** ab ek jawab ke andar **kai sentences** aa sakte hain, har ek ka apna `question_text`/`video_start`/`done` cycle. Do zaroori cheezein:
-1. **Data receive karna aur play karna alag kar diya** — backend se sentence 2 ka data jaldi aa sakta hai (jabki sentence 1 abhi bhi play ho raha hai), par **playback hamesha queue se, ek ke baad ek** hota hai — warna do sentences ka audio overlap ho jata.
-2. Mic sirf **last sentence** (`final: true`) ke baad unlock hota hai.
-
-### 9.5 Bugs jo mile is phase mein
-
-| Bug | Lakshan | Wajah | Fix |
-|---|---|---|---|
-| Modal se connect karte waqt turant fail | `TimeoutError: timed out during opening handshake` | `websockets.connect()` ka default timeout 10s hai, Modal cold container 30-90s leta hai | `open_timeout=600` (`modal_client.py`) — humare apne `tools/ws_h264_view.py` mein pehle se tha, `modal_client.py` mein bhool gaya tha |
-| "You said: ''" — candidate ka jawab hamesha khali | Deepgram `confidence: 0.0`, `words: []`, par `duration` sahi bata raha tha | **Ye code ka bug nahi tha** — laptop ka default mic OS level pe **mute** tha (`pactl` se confirm kiya: `Source #6 ... Mute: yes`) | `pactl set-source-mute ... 0` se unmute kiya |
-
-Dusra wala isliye important hai: agar humne turant code mein bug dhoondhna shuru kar diya hota, time waste hota. Debug logging (`[stt] received X bytes...`, Deepgram ka **poora raw response**) add karne se turant pata chal gaya ki bytes-to-duration ratio real speech se bahut kam hai — jo silence recording ka clear signal tha.
-
-### 9.6 UI improvements
-
-1. **Cold-start / "session ban rahi hai" ke liye loading overlay** — "Start Interview" dabate hi ek acha overlay (spinner + "Creating your interview session... This may take a moment.") dikhta hai.
-2. **Text, audio, video ek saath reveal hote hain** — pehle text turant aa jata tha, audio/video baad mein. Ab `question_text` message text ko **turant screen pe nahi daalta** — usay ek `TurnPlayer.onReveal` callback mein hold kiya jata hai, jo **audio actually play hone ke exact moment** pe chalta hai. Isi moment pe loading overlay bhi hide hota hai.
-3. **Answer submit karne ke baad processing spinner** — chhota spinner buttons ke paas, jab tak agla sawal (audio+video ke saath) ready na ho jaye.
-
-### 9.7 Ab tak ka status (Part B)
-
-**Kaam karta hai:**
-- Poora ek-turn pipeline: LLM ne sawal banaya, TTS ne audio banaya, Modal se frames aaye — sab kuch relay hua (isolated test se verify kiya, minimal API credits use karke — TTS/LLM sirf ek baar call kiya, Modal wala fix saved audio reuse karke dobara test kiya).
-- Browser mein mic recording, WebCodecs decode, aur audio+video sync playback — code review se verify kiya, saath hi Python-side sentence-splitting logic fake data se unit-tested.
-
-**Abhi verify nahi hua (browser mein khud test karna hoga):**
-- Mic se real jawab record karke poora multi-sentence loop chalna (STT → LLM stream → TTS pipeline → Modal → browser) — code likha aur review kiya hai, live nahi chalaya (API credits bachane ke liye).
-- Lip-sync ka audio-video sync aankh-kaan se dekhna.
-
-**Baaki kaam (Part A ke priorities ke alawa):**
-- Candidate ke jawab ka audio compress karna (Opus/MP3), abhi WAV/webm jaisa bhi hai jo bhi MediaRecorder deta hai.
-- Backend WebSocket pe bhi auth/session token (abhi koi nahi).
-- Multi-sentence answer mein agar beech ke sentence ka Modal call fail ho, to poora flow thoda uneven ho sakta hai — abhi sirf best-effort error handling hai.
-
-### 9.8 Kaise chalate hain
-
-Poori setup aur run instructions **[README.md](README.md)** mein hain (English mein, naye setup ke liye). Chhota version:
-
-```bash
-# Terminal 1 — GPU lip-sync service
-cd "avatar gpu test" && source venv/bin/activate && modal serve server.py
-
-# Terminal 2 — interview backend (frontend bhi isi se serve hota hai)
-cd "avatar gpu test/interview-poc/backend" && source venv/bin/activate
-python3 -m uvicorn server:app --port 8091
-```
-Browser mein `http://localhost:8091` kholo.
-
----
-
-## 10. Poori kahani, dono parts milake
-
-**Part A (GPU service):** MuseTalk avatar ko Modal A100 pe chalate hain, WebSocket se real-time se tez lip-sync video milta hai (~45-48 fps warm, real-time = 25 fps).
-
-**Part B (interview app):** Isi service ke upar ek poori spoken-interview application — candidate bolta hai, Deepgram sunta hai, OpenAI agla sawal sochta hai aur bolta hai (streamed, sentence-by-sentence, taaki latency kam rahe), aur avatar wahi sawal lip-synced video mein poochta hai. Sab kuch browser mein WebCodecs + Web Audio se 25fps pe, text/audio/video **ek saath** reveal hoke chalta hai.
-
-**Ab jo sabse zaroori hai:** browser mein end-to-end khud test karna (mic se bolke poora loop chalana), phir cold-start aur network (India ke paas region) wale Part A ke pending items, phir production hardening (auth, deploy).
-

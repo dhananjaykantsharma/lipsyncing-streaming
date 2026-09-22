@@ -1,22 +1,13 @@
 // Interview POC frontend.
 //
-// The backend streams the LLM's answer sentence-by-sentence (each sentence
-// gets its own TTS + Modal lip-sync turn, pipelined with the next sentence's
-// LLM/TTS work) rather than waiting for the whole (possibly multi-sentence)
-// answer before doing anything. So a single logical "turn" is really a
-// sequence of one or more of these cycles, each with its own `final` flag
-// on the last message of the cycle:
-//
 // Protocol (matches backend/server.py):
 //   we send    binary: candidate's recorded answer (one blob, webm/opus)
 //   we receive {"type":"answer_text","text":...}          STT result (debug display)
-//   -- one cycle per sentence, repeated until final:true --
-//   we receive {"type":"question_text","text":...,"final":bool}
-//   we receive binary [0x01][WAV bytes]                    TTS audio for that sentence
+//   we receive {"type":"question_text","text":...}        next question
+//   we receive binary [0x01][WAV bytes]                    TTS audio for that question
 //   we receive {"type":"video_start","width","height","fps"}
 //   we receive binary [0x02][<Modal's frame packet>]        = [1B flags][4B seq][H.264 Annex-B access unit]
-//   we receive {"type":"done","final":bool}                 this sentence finished generating
-//   -- /cycle --
+//   we receive {"type":"done"}                              turn finished
 //   we receive {"type":"error","message":...}
 //
 // The H.264 stream is Annex-B with SPS/PPS repeated on every keyframe (verified
@@ -28,9 +19,7 @@
 // clock, frames are decoded/drawn to keep up with a fixed 25 fps schedule,
 // held on the last frame if the next packet hasn't arrived yet, and skipped
 // (but still decoded, since H.264 frames depend on their predecessors) if we
-// ever fall behind. Sentences are queued and played strictly one at a time
-// (see playQueue/drivePlayQueue) so a fast-arriving sentence 2 never starts
-// playing over sentence 1 — only DATA can arrive ahead, not audio.
+// ever fall behind.
 
 const FPS = 25;
 const PREBUFFER_S = 0.5;
@@ -140,7 +129,6 @@ class TurnPlayer {
     this.clock = null;
     this.ttsArrayBuffer = null;
     this._rafId = null;
-    this.final = false; // is this the last sentence of the current answer?
   }
 
   onVideoStart(msg) {
@@ -172,10 +160,9 @@ class TurnPlayer {
     this.ttsArrayBuffer = arrayBuffer;
   }
 
-  onDone(isFinal) {
+  onDone() {
     this.done = true;
     this.total = this.nRecv;
-    this.final = isFinal;
   }
 
   // Waits for a small prebuffer, starts audio, then paces frames to it.
@@ -267,22 +254,9 @@ class Recorder {
 // ---------------------------------------------------------------------
 let ws = null;
 let audioCtx = null;
+let currentPlayer = null;
 let recorder = null;
 let recording = false;
-
-// The backend now streams the answer sentence-by-sentence (LLM -> TTS ->
-// Modal pipelined per sentence), so a single logical "turn" can involve
-// several question_text/video_start/done cycles in a row. We keep two
-// separate notions of "current":
-//   receivingPlayer — whichever sentence's data is arriving from the
-//                      backend right now (can run ahead of playback)
-//   playQueue        — sentences waiting to be PLAYED, strictly in order,
-//                      one at a time, so sentence 2's audio never starts
-//                      before sentence 1 has finished (no overlap)
-let receivingPlayer = null;
-let playQueue = [];
-let playing = false;
-let answerInProgress = false;
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -300,9 +274,9 @@ function connect() {
       const tag = bytes[0];
       const payload = bytes.slice(1);
       if (tag === TAG_TTS_AUDIO) {
-        receivingPlayer && receivingPlayer.onTtsAudio(payload.buffer);
+        currentPlayer && currentPlayer.onTtsAudio(payload.buffer);
       } else if (tag === TAG_VIDEO_FRAME) {
-        receivingPlayer && receivingPlayer.onVideoFrame(payload);
+        currentPlayer && currentPlayer.onVideoFrame(payload);
       }
     }
   };
@@ -311,63 +285,40 @@ function connect() {
   ws.onerror = () => setStatus("Connection error.");
 }
 
-// Plays queued sentences strictly one after another. Only one of these
-// loops ever runs at a time (guarded by `playing`).
-async function drivePlayQueue() {
-  while (playQueue.length > 0) {
-    const player = playQueue.shift();
-    await player.play();
-    if (player.final) {
-      answerInProgress = false;
-      onTurnFinished();
-    }
-  }
-  playing = false;
-}
-
 async function handleControl(msg) {
   switch (msg.type) {
     case "answer_text":
       el.answer.textContent = `You said: "${msg.text}"`;
       break;
 
-    case "question_text": {
+    case "question_text":
       // don't show the text yet — held back until audio+video are actually
       // about to play, so everything appears together (TurnPlayer.onReveal)
-      if (!answerInProgress) {
-        el.question.textContent = "";
-        answerInProgress = true;
-      }
       el.answer.textContent = "";
       el.recordBtn.disabled = true;
-      const sentenceText = msg.text;
-      receivingPlayer = new TurnPlayer(audioCtx, () => {
-        el.question.textContent += (el.question.textContent ? " " : "") + sentenceText;
+      currentPlayer = new TurnPlayer(audioCtx, () => {
+        el.question.textContent = msg.text;
         hideLoading();
         hideProcessing();
         setStatus("Interviewer is speaking...");
       });
-      playQueue.push(receivingPlayer);
-      if (!playing) {
-        playing = true;
-        drivePlayQueue();
-      }
       break;
-    }
 
     case "video_start":
-      receivingPlayer.onVideoStart(msg);
+      currentPlayer.onVideoStart(msg);
+      // don't await here: play() resolves only once the turn's video has
+      // fully finished, which is exactly when we want to unlock the mic
+      currentPlayer.play().then(onTurnFinished);
       break;
 
     case "done":
-      receivingPlayer.onDone(msg.final);
+      currentPlayer.onDone();
       break;
 
     case "error":
       setStatus(`Error: ${msg.message}`);
       hideLoading();
       hideProcessing();
-      answerInProgress = false;
       el.recordBtn.disabled = false;
       break;
   }

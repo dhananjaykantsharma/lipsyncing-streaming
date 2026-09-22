@@ -4,17 +4,11 @@ Protocol (browser <-> this server, over one WebSocket at /session):
   browser -> server   binary: the candidate's recorded answer (one blob, sent
                        once the "I'm done answering" button is pressed)
   server  -> browser  {"type": "answer_text", "text": ...}      STT result
-
-  The LLM's answer is streamed and split into sentences (see session.py);
-  each sentence gets its own TTS + Modal lip-sync turn, pipelined with the
-  next sentence's LLM/TTS work. So the group below repeats once per
-  sentence, with "final": true only on the last one:
-  server  -> browser  {"type": "question_text", "text": ..., "final": bool}
-  server  -> browser  binary: [0x01][WAV bytes]                 TTS audio for that sentence
+  server  -> browser  {"type": "question_text", "text": ...}    next question
+  server  -> browser  binary: [0x01][WAV bytes]                 TTS audio
   server  -> browser  {"type": "video_start", "width", "height", "fps"}
   server  -> browser  binary: [0x02][<Modal's own frame packet, untouched>]
-  server  -> browser  {"type": "done", "final": bool}           this sentence finished
-
+  server  -> browser  {"type": "done"}                          turn finished
   server  -> browser  {"type": "error", "message": ...}
 """
 from pathlib import Path

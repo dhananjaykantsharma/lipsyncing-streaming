@@ -1,11 +1,6 @@
 """One interview session = one browser connection = one Modal connection.
-
-Orchestrates STT -> LLM (streamed, sentence-by-sentence) -> TTS -> Modal ->
-relay frames. A multi-sentence question is pipelined: sentence 2's TTS
-starts generating (as a background task) the moment the LLM finishes
-streaming it, while sentence 1 is still being lip-synced by Modal — so by
-the time Modal is ready for sentence 2, its audio is usually already there."""
-import asyncio
+Orchestrates STT -> LLM -> (send text) -> TTS -> Modal -> (relay frames)."""
+import json
 
 import llm
 import stt
@@ -26,48 +21,23 @@ class Session:
 
     async def start(self):
         """No candidate answer yet — ask the opening question."""
-        await self._respond()
+        question = await llm.next_question(self.history)
+        self.history.append({"role": "assistant", "content": question})
+        await self._ask(question)
 
     async def handle_answer(self, audio_bytes: bytes, content_type: str = "audio/webm"):
         text = await stt.transcribe(audio_bytes, content_type=content_type)
         self.history.append({"role": "user", "content": text})
         await self.send_json({"type": "answer_text", "text": text})
-        await self._respond()
 
-    async def _respond(self):
-        """Pulls sentences off llm.stream_question() and, for each one, kicks
-        off its TTS immediately (as a background task) rather than waiting —
-        so LLM+TTS for the NEXT sentence overlap with the CURRENT sentence's
-        Modal lip-sync. A queue keeps them in order for Modal/the browser,
-        which both need sentences delivered sequentially."""
-        queue: asyncio.Queue = asyncio.Queue()
-        parts: list[str] = []
+        question = await llm.next_question(self.history)
+        self.history.append({"role": "assistant", "content": question})
+        await self._ask(question)
 
-        async def produce():
-            async for sentence, is_final in llm.stream_question(self.history):
-                parts.append(sentence)
-                tts_task = asyncio.create_task(tts.synthesize(sentence))
-                await queue.put((sentence, is_final, tts_task))
-            await queue.put(None)  # sentinel: no more sentences
+    async def _ask(self, question_text: str):
+        await self.send_json({"type": "question_text", "text": question_text})
 
-        producer = asyncio.create_task(produce())
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                sentence, is_final, tts_task = item
-                await self._ask_sentence(sentence, is_final, tts_task)
-        finally:
-            await producer  # propagate any exception raised while streaming the LLM
-
-        if parts:
-            self.history.append({"role": "assistant", "content": " ".join(parts)})
-
-    async def _ask_sentence(self, text: str, is_final: bool, tts_task: asyncio.Task):
-        await self.send_json({"type": "question_text", "text": text, "final": is_final})
-
-        audio_bytes = await tts_task
+        audio_bytes = await tts.synthesize(question_text)
         await self.send_binary(bytes([TAG_TTS_AUDIO]) + audio_bytes)
 
         async def on_json(data):
@@ -79,7 +49,7 @@ class Session:
                     "fps": data.get("fps"),
                 })
             elif data.get("type") == "done":
-                await self.send_json({"type": "done", "final": is_final})
+                await self.send_json({"type": "done"})
 
         async def on_binary(msg: bytes):
             await self.send_binary(bytes([TAG_VIDEO_FRAME]) + msg)
