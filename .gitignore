@@ -1,0 +1,26 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- virtual envs (root venv, interview-poc/backend/venv, any others) ---
+venv/
+.venv/
+
+# --- secrets ---
+.env
+!.env.example
+
+# --- generated / regenerable test artifacts ---
+test_audio.wav
+test_output.mp4
+audio10.wav
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

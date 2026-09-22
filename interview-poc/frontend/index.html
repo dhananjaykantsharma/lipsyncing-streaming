@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Interview POC</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>Interview POC</h1>
+
+    <div id="stage">
+      <canvas id="avatar" width="1280" height="720"></canvas>
+
+      <div id="loadingOverlay" class="overlay hidden">
+        <div class="spinner"></div>
+        <p id="loadingText">Creating your interview session...</p>
+        <p class="loading-sub">This may take a moment.</p>
+      </div>
+    </div>
+
+    <p id="status">Not connected.</p>
+    <p id="question"></p>
+    <p id="answer"></p>
+
+    <div id="controls">
+      <button id="startBtn">Start Interview</button>
+      <button id="recordBtn" disabled>Start Answer</button>
+      <span id="processingSpinner" class="spinner small hidden"></span>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
