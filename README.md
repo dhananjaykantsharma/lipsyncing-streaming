@@ -168,6 +168,22 @@ grant microphone access, and go.
 `pkill -INT -f "[v]env/bin/modal serve server.py"`) when you're done, and
 confirm with `modal app list` that no app is left running.
 
+### Latency logs
+
+Every session writes `interview-poc/backend/logs/session_<time>_<id>.json`
+(path printed at session start, rewritten after every turn). Per turn:
+
+| Section | What it measures |
+|---|---|
+| `timeline_ms` | when each backend step finished, ms since the answer arrived |
+| `stt` / `llm` / `tts` | `total_ms`, vendor compute (`server_processing_ms` / Deepgram `net.server_wait_ms`), network split |
+| `modal` | backend view: `connect_ms`, `ping_rtt_ms`, `first_packet_ms`, `done_ms`, packet gaps |
+| `modal_server` | GPU side: `audio_load_mel_s`, `whisper_s`, `first_batch_ready_s`, GPU/blend/encode per frame, `realtime_factor` |
+| `network` | derived network time per hop (browser↔backend, backend↔Modal/OpenAI/Deepgram) |
+| `client` | browser: `avatar_speaking_ms` (click → avatar talks), `prebuffer_ready_ms`, `stall_ms` |
+
+`summary` holds mean/min/max of every number across turns.
+
 ---
 
 ## Status

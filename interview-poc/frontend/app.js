@@ -4,11 +4,14 @@
 //   we send    binary: candidate's recorded answer (one blob, webm/opus)
 //   we receive {"type":"answer_text","text":...}          STT result (debug display)
 //   we receive {"type":"question_text","text":...}        next question
-//   we receive binary [0x01][WAV bytes]                    TTS audio for that question
+//   we receive binary [0x01][MP3 bytes]                    TTS audio for that question
 //   we receive {"type":"video_start","width","height","fps"}
 //   we receive binary [0x02][<Modal's frame packet>]        = [1B flags][4B seq][H.264 Annex-B access unit]
 //   we receive {"type":"done"}                              turn finished
 //   we receive {"type":"error","message":...}
+//   latency reporting (backend writes it to backend/logs/session_*.json):
+//   we send    {"type":"ping","id"} -> we receive {"type":"pong","id"}
+//   we send    {"type":"client_metrics","turn","metrics":{...}} once a turn finishes playing
 //
 // The H.264 stream is Annex-B with SPS/PPS repeated on every keyframe (verified
 // against the actual encoder output), so VideoDecoder.configure() is called
@@ -73,7 +76,20 @@ function sleep(ms) {
 }
 
 // ---------------------------------------------------------------------
-// Audio master clock: plays one WAV clip, exposes position() in seconds.
+// Per-turn latency metrics. t0 = the click that started the turn ("Done
+// Answering", or "Start Interview" for the opening question); every *_ms
+// mark is milliseconds since then. Sent to the backend when the turn ends.
+// ---------------------------------------------------------------------
+function newTurnMetrics(extra) {
+  return { t0: performance.now(), values: { ...extra } };
+}
+function markT(m, name, overwrite = false) {
+  if (!m || (!overwrite && m.values[name] !== undefined)) return;
+  m.values[name] = Math.round((performance.now() - m.t0) * 10) / 10;
+}
+
+// ---------------------------------------------------------------------
+// Audio master clock: plays one TTS clip (MP3), exposes position() in seconds.
 // ---------------------------------------------------------------------
 class AudioClock {
   constructor(audioCtx) {
@@ -129,11 +145,16 @@ class TurnPlayer {
     this.clock = null;
     this.ttsArrayBuffer = null;
     this._rafId = null;
+    this.metrics = null; // set by handleControl("question_text")
+    this.turnId = null;
+    this.stallMs = 0;
+    this.stallEvents = 0;
   }
 
   onVideoStart(msg) {
     this.decoder = new VideoDecoder({
       output: (frame) => {
+        markT(this.metrics, "first_frame_decoded_ms");
         if (this.latestFrame) this.latestFrame.close();
         this.latestFrame = frame;
       },
@@ -154,13 +175,17 @@ class TurnPlayer {
     const data = payload.slice(5);
     this.packets.push({ data, isKey });
     this.nRecv++;
+    markT(this.metrics, "first_packet_ms");
+    markT(this.metrics, "last_packet_ms", true);
   }
 
   onTtsAudio(arrayBuffer) {
+    markT(this.metrics, "tts_audio_ms");
     this.ttsArrayBuffer = arrayBuffer;
   }
 
   onDone() {
+    markT(this.metrics, "done_ms");
     this.done = true;
     this.total = this.nRecv;
   }
@@ -177,18 +202,38 @@ class TurnPlayer {
       // wait a little longer just in case of reordering/slow network.
       for (let i = 0; i < 100 && this.ttsArrayBuffer === null; i++) await sleep(20);
     }
+    markT(this.metrics, "prebuffer_ready_ms");
 
     this.clock = new AudioClock(this.audioCtx);
+    const tDecode = performance.now();
     await this.clock.start(this.ttsArrayBuffer);
+    if (this.metrics) {
+      this.metrics.values.audio_decode_ms = Math.round((performance.now() - tDecode) * 10) / 10;
+      this.metrics.values.audio_duration_s = Math.round(this.clock.duration * 1000) / 1000;
+    }
+    // THE headline number: click -> avatar audibly/visibly speaking
+    markT(this.metrics, "avatar_speaking_ms");
     if (this.onReveal) this.onReveal();
 
+    let lastTick = performance.now();
+    let starving = false;
     return new Promise((resolve) => {
       const tick = () => {
+        const now = performance.now();
         const pos = this.clock.position();
         const target = pos >= 0 ? Math.floor(pos * FPS) : -1;
         const newest = this.nRecv - 1;
         const want = this.total === null ? target : Math.min(target, this.total - 1);
         const upto = Math.min(want, newest);
+
+        // stall = the audio clock wants a frame that hasn't arrived yet, so
+        // the avatar freezes on its last frame while the audio keeps going
+        if (upto < want) {
+          if (!starving) this.stallEvents++;
+          this.stallMs += now - lastTick;
+        }
+        starving = upto < want;
+        lastTick = now;
 
         while (this.decodedCount <= upto && this.packets.length > 0) {
           const pkt = this.packets.shift();
@@ -206,6 +251,16 @@ class TurnPlayer {
 
         const finishedAt = Math.max((this.total || 0) / FPS, this.clock.duration) + 0.15;
         if (this.done && this.total !== null && pos >= finishedAt) {
+          if (this.metrics) {
+            markT(this.metrics, "playback_end_ms");
+            Object.assign(this.metrics.values, {
+              packets_received: this.nRecv,
+              frames_decoded: this.decodedCount,
+              video_duration_s: Math.round((this.total / FPS) * 1000) / 1000,
+              stall_ms: Math.round(this.stallMs),
+              stall_events: this.stallEvents,
+            });
+          }
           this.clock.stop();
           if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
           resolve();
@@ -257,13 +312,37 @@ let audioCtx = null;
 let currentPlayer = null;
 let recorder = null;
 let recording = false;
+let pendingMetrics = null; // the turn being waited on (created at the click)
+let recordStartedAt = null;
+const pendingPongs = new Map();
+
+// browser <-> backend websocket round trip (sent while the backend is idle)
+function measureRtt() {
+  return new Promise((resolve) => {
+    const id = Math.random().toString(36).slice(2);
+    const t = performance.now();
+    pendingPongs.set(id, () => resolve(Math.round((performance.now() - t) * 10) / 10));
+    ws.send(JSON.stringify({ type: "ping", id }));
+    setTimeout(() => { if (pendingPongs.delete(id)) resolve(null); }, 5000);
+  });
+}
+
+async function reportMetrics(player) {
+  if (!player.metrics || player.turnId === null) return;
+  const values = { ...player.metrics.values, ws_rtt_ms: await measureRtt() };
+  ws.send(JSON.stringify({ type: "client_metrics", turn: player.turnId, metrics: values }));
+  console.log(`turn ${player.turnId} latency`, values);
+}
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/session`);
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => setStatus("Connected. Waiting for the first question...");
+  ws.onopen = () => {
+    markT(pendingMetrics, "ws_open_ms");
+    setStatus("Connected. Waiting for the first question...");
+  };
 
   ws.onmessage = async (event) => {
     if (typeof event.data === "string") {
@@ -288,6 +367,12 @@ function connect() {
 async function handleControl(msg) {
   switch (msg.type) {
     case "answer_text":
+      if (pendingMetrics) {
+        markT(pendingMetrics, "answer_text_ms");
+        // from the moment the blob was handed to the socket (excludes recorder finalize)
+        pendingMetrics.values.answer_text_after_send_ms =
+          pendingMetrics.values.answer_text_ms - pendingMetrics.values.answer_sent_ms;
+      }
       el.answer.textContent = `You said: "${msg.text}"`;
       break;
 
@@ -296,24 +381,44 @@ async function handleControl(msg) {
       // about to play, so everything appears together (TurnPlayer.onReveal)
       el.answer.textContent = "";
       el.recordBtn.disabled = true;
+      markT(pendingMetrics, "question_text_ms");
       currentPlayer = new TurnPlayer(audioCtx, () => {
         el.question.textContent = msg.text;
         hideLoading();
         hideProcessing();
         setStatus("Interviewer is speaking...");
       });
+      currentPlayer.metrics = pendingMetrics;
+      currentPlayer.turnId = msg.turn ?? null;
+      pendingMetrics = null;
       break;
 
     case "video_start":
+      markT(currentPlayer.metrics, "video_start_ms");
       currentPlayer.onVideoStart(msg);
       // don't await here: play() resolves only once the turn's video has
       // fully finished, which is exactly when we want to unlock the mic
-      currentPlayer.play().then(onTurnFinished);
+      {
+        const player = currentPlayer;
+        player.play().then(() => {
+          onTurnFinished();
+          reportMetrics(player);
+        });
+      }
       break;
 
     case "done":
       currentPlayer.onDone();
       break;
+
+    case "pong": {
+      const done = pendingPongs.get(msg.id);
+      if (done) {
+        pendingPongs.delete(msg.id);
+        done();
+      }
+      break;
+    }
 
     case "error":
       setStatus(`Error: ${msg.message}`);
@@ -332,6 +437,7 @@ function onTurnFinished() {
 async function onStart() {
   el.startBtn.disabled = true;
   el.startBtn.style.display = "none";
+  pendingMetrics = newTurnMetrics({ kind: "opening" });
   showLoading("Creating your interview session...");
   audioCtx = new AudioContext();
   recorder = new Recorder();
@@ -347,11 +453,16 @@ async function onRecordClick() {
       return;
     }
     recording = true;
+    recordStartedAt = performance.now();
     el.recordBtn.textContent = "Done Answering";
     el.recordBtn.classList.add("recording");
     setStatus("Recording your answer...");
   } else {
     recording = false;
+    const metrics = newTurnMetrics({
+      kind: "answer",
+      recording_s: Math.round(performance.now() - recordStartedAt) / 1000,
+    });
     el.recordBtn.textContent = "Start Answer";
     el.recordBtn.classList.remove("recording");
     el.recordBtn.disabled = true;
@@ -360,7 +471,10 @@ async function onRecordClick() {
     const blob = await recorder.stop();
     console.log(`recorded answer: ${blob.size} bytes, type=${blob.type}`);
     const buf = await blob.arrayBuffer();
+    metrics.values.answer_blob_bytes = buf.byteLength;
+    pendingMetrics = metrics;
     ws.send(buf);
+    markT(metrics, "answer_sent_ms"); // click -> sent = MediaRecorder finalize
   }
 }
 

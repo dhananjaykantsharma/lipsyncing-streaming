@@ -9,6 +9,16 @@ AVATAR_ID = "avatar_1"
 VERSION = "v15"
 
 
+def _audio_suffix(audio_bytes: bytes) -> str:
+    """Temp-file extension for the incoming audio: librosa/soundfile choose
+    the decoder from it, so MP3 bytes saved as .wav would fail to load."""
+    if audio_bytes[:3] == b"ID3" or (len(audio_bytes) > 1 and audio_bytes[0] == 0xFF and audio_bytes[1] & 0xE0 == 0xE0):
+        return ".mp3"
+    if audio_bytes[:4] == b"OggS":
+        return ".ogg"
+    return ".wav"
+
+
 def _summ(xs):
     """count / mean / p50 / p95 / max / total of a list of seconds, in ms."""
     if not xs:
@@ -81,6 +91,11 @@ class MuseTalkInference:
         unet.model = unet.model.half().to(device)
         weight_dtype = unet.model.dtype
 
+        import soundfile
+        # TTS audio arrives as MP3; without soundfile MP3 support librosa
+        # falls back to the (much slower) audioread/ffmpeg path
+        print(f"soundfile {soundfile.__libsndfile_version__}: MP3 decode = {'MP3' in soundfile.available_formats()}")
+
         whisper_dir = f"{repo}/models/whisper"
         audio_processor = AudioProcessor(feature_extractor_path=whisper_dir)
         whisper = WhisperModel.from_pretrained(whisper_dir)
@@ -137,7 +152,7 @@ class MuseTalkInference:
         import tempfile
         import uuid
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=_audio_suffix(audio_bytes), delete=False) as f:
             f.write(audio_bytes)
             audio_path = f.name
 
@@ -247,7 +262,7 @@ class MuseTalkInference:
                     continue
             return False
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=_audio_suffix(audio_bytes), delete=False) as f:
             f.write(audio_bytes)
             audio_path = f.name
 
@@ -255,10 +270,16 @@ class MuseTalkInference:
         enc_thread = threading.Thread(target=encode_loop, daemon=True)
         enc_thread.start()
         try:
-            t_audio = time.perf_counter()
+            t_start = time.perf_counter()
+            t_audio = t_start
+            # CPU: librosa load (+ resample to 16 kHz) and mel features
             whisper_input_features, librosa_length = rt.audio_processor.get_audio_feature(
                 audio_path, weight_dtype=rt.weight_dtype
             )
+            stats["audio_load_mel_s"] = round(time.perf_counter() - t_audio, 3)
+            stats["audio_duration_s"] = round(librosa_length / 16000, 3)
+            t_whisper = time.perf_counter()
+            # GPU: whisper encoder over the WHOLE clip, before any frame is made
             whisper_chunks = rt.audio_processor.get_whisper_chunk(
                 whisper_input_features,
                 rt.device,
@@ -269,10 +290,13 @@ class MuseTalkInference:
                 audio_padding_length_left=rt.args.audio_padding_length_left,
                 audio_padding_length_right=rt.args.audio_padding_length_right,
             )
+            torch.cuda.synchronize()
+            stats["whisper_s"] = round(time.perf_counter() - t_whisper, 3)
             stats["audio_features_s"] = round(time.perf_counter() - t_audio, 3)
             stats["total_frames_expected"] = len(whisper_chunks)
 
             gen = rt.datagen(whisper_chunks, avatar.input_latent_list_cycle, avatar.batch_size)
+            t_loop = time.perf_counter()
 
             idx = 0
             for whisper_batch, latent_batch in gen:
@@ -290,11 +314,17 @@ class MuseTalkInference:
                 gpu_s = time.perf_counter() - t_gpu
                 stats["gpu_batch"].append(gpu_s)
                 stats["gpu_per_frame"].append(gpu_s / max(1, len(recon)))
+                if "first_batch_ready_s" not in stats:
+                    # pipeline start -> first batch of frames off the GPU
+                    stats["first_batch_ready_s"] = round(time.perf_counter() - t_start, 3)
+                    stats["first_batch_frames"] = len(recon)
 
                 for res_frame in recon:
                     if not put_pending(pool.submit(blend, idx, res_frame)):
                         break
                     idx += 1
+            # all GPU batches, incl. time blocked on a full blend/encode queue
+            stats["gpu_loop_s"] = round(time.perf_counter() - t_loop, 3)
         finally:
             while enc_thread.is_alive():
                 try:
@@ -391,13 +421,16 @@ class MuseTalkInference:
 
                     sent = 0
                     first_packet_s = None
+                    ws_send_s = 0.0
                     try:
                         while True:
                             item = await out_q.get()
                             if item is None:
                                 break
                             seq, key, data = item
+                            t_send = time.perf_counter()
                             await websocket.send_bytes(struct.pack(">BI", 1 if key else 0, seq) + data)
+                            ws_send_s += time.perf_counter() - t_send
                             sent += 1
                             if first_packet_s is None:
                                 first_packet_s = time.perf_counter() - t_recv
@@ -406,10 +439,26 @@ class MuseTalkInference:
 
                     pb = gen_stats.get("packet_bytes", [])
                     depth = gen_stats.get("pending_depth", [])
+                    server_total_s = time.perf_counter() - t_recv
+                    audio_dur = gen_stats.get("audio_duration_s")
                     server_stats = {
-                        "server_total_s": round(time.perf_counter() - t_recv, 2),
-                        "server_first_packet_s": round(first_packet_s or 0, 2),
+                        "server_total_s": round(server_total_s, 3),
+                        "server_first_packet_s": round(first_packet_s or 0, 3),
+                        "audio_upload_bytes": len(audio_bytes),
+                        "audio_duration_s": audio_dur,
+                        # CPU: audio decode + resample + mel
+                        "audio_load_mel_s": gen_stats.get("audio_load_mel_s"),
+                        # GPU: whisper encoder over the whole clip
+                        "whisper_s": gen_stats.get("whisper_s"),
                         "audio_features_s": gen_stats.get("audio_features_s"),
+                        # pipeline start -> first GPU batch done (includes whisper)
+                        "first_batch_ready_s": gen_stats.get("first_batch_ready_s"),
+                        "first_batch_frames": gen_stats.get("first_batch_frames"),
+                        "gpu_loop_s": gen_stats.get("gpu_loop_s"),
+                        # < 1.0 => generated faster than it plays back
+                        "realtime_factor": round(server_total_s / audio_dur, 3) if audio_dur else None,
+                        # time blocked pushing packets into the socket (slow downlink shows up here)
+                        "ws_send_total_s": round(ws_send_s, 3),
                         "frames_expected": gen_stats.get("total_frames_expected"),
                         "packets_sent": sent,
                         "keyframes": gen_stats.get("keyframes"),

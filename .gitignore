@@ -19,6 +19,9 @@ test_audio.wav
 test_output.mp4
 audio10.wav
 
+# --- per-session latency logs (interview-poc/backend/latency_log.py) ---
+interview-poc/backend/logs/
+
 # --- OS / editor cruft ---
 .DS_Store
 Thumbs.db

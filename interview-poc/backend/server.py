@@ -5,20 +5,35 @@ Protocol (browser <-> this server, over one WebSocket at /session):
                        once the "I'm done answering" button is pressed)
   server  -> browser  {"type": "answer_text", "text": ...}      STT result
   server  -> browser  {"type": "question_text", "text": ...}    next question
-  server  -> browser  binary: [0x01][WAV bytes]                 TTS audio
+  server  -> browser  binary: [0x01][MP3 bytes]                 TTS audio
   server  -> browser  {"type": "video_start", "width", "height", "fps"}
   server  -> browser  binary: [0x02][<Modal's own frame packet, untouched>]
   server  -> browser  {"type": "done"}                          turn finished
   server  -> browser  {"type": "error", "message": ...}
+
+Latency reporting (see latency_log.py; one JSON per session in backend/logs/):
+  browser -> server   {"type": "ping", "id"}  ->  server -> browser {"type": "pong", "id"}
+  browser -> server   {"type": "client_metrics", "turn", "metrics": {...}}
+  (question_text / answer_text carry "turn" so the browser can tag its metrics)
 """
+import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+import http_clients
 from session import Session
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await http_clients.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
@@ -37,8 +52,13 @@ async def session_endpoint(websocket: WebSocket):
     try:
         await session.start()
         while True:
-            audio_bytes = await websocket.receive_bytes()
-            await session.handle_answer(audio_bytes)
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(msg.get("code", 1000))
+            if msg.get("bytes") is not None:
+                await session.handle_answer(msg["bytes"])
+            elif msg.get("text") is not None:
+                await session.handle_client_message(json.loads(msg["text"]))
     except WebSocketDisconnect:
         pass
     except Exception as e:

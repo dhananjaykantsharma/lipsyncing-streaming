@@ -3,28 +3,34 @@
 Push-to-talk means we already have the candidate's whole answer as one blob
 by the time we call this, so the simple REST endpoint is enough — no need
 for Deepgram's streaming/websocket API."""
-import httpx
-
 from config import DEEPGRAM_API_KEY
+from http_clients import deepgram, traced
 
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 
-
-async def transcribe(audio_bytes: bytes, content_type: str = "audio/webm") -> str:
+async def transcribe(audio_bytes: bytes, content_type: str = "audio/webm", metrics: dict | None = None) -> str:
+    """`metrics`, if given, is filled with the network phase split and the
+    answer's audio duration."""
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY is not set (backend/.env)")
 
     print(f"[stt] received {len(audio_bytes)} bytes, content_type={content_type}")
 
     params = {"model": "nova-2", "smart_format": "true", "punctuate": "true"}
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": content_type}
+    headers = {"Content-Type": content_type}
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(DEEPGRAM_URL, params=params, headers=headers, content=audio_bytes)
-        resp.raise_for_status()
-        data = resp.json()
+    # shared client (http_clients.py): the TLS connection is reused across turns
+    with traced() as trace:
+        resp = await deepgram.post("/v1/listen", params=params, headers=headers, content=audio_bytes)
+    resp.raise_for_status()
+    data = resp.json()
 
     print(f"[stt] deepgram response: {data}")
+
+    if metrics is not None:
+        meta = data.get("metadata", {})
+        metrics["audio_bytes"] = len(audio_bytes)
+        metrics["audio_duration_s"] = meta.get("duration")
+        metrics["net"] = trace.phases()
 
     try:
         return data["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
