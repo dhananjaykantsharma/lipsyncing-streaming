@@ -2,5 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 httpx
+# the OpenAI SDK's own httpx fork; http_clients.py builds its client with it
+httpx2
 openai
 websockets

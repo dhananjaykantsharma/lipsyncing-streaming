@@ -1,14 +1,20 @@
 """One persistent connection to Modal's MuseTalk /ws-stream endpoint, reused
 across every turn of one interview session (Modal's own server already loops
 `while True: audio_bytes = await websocket.receive_bytes()`, so we don't
-need to reconnect per turn — that also keeps the GPU container warm)."""
+need to reconnect per turn — that also keeps the GPU container warm).
+
+Modal counts an open websocket as a running request, so while it's open the
+GPU container can never scale down. After MODAL_IDLE_CLOSE_S without a turn
+(e.g. a tab left open) the connection is closed; the next turn reconnects
+(a cold start if the container has stopped by then)."""
 import asyncio
 import json
 import time
 
 import websockets
+from websockets.protocol import State
 
-from config import MODAL_WS_URL
+from config import MODAL_IDLE_CLOSE_S, MODAL_WS_URL
 from latency_log import ms_since
 
 # gap between two consecutive video packets above which playback would have
@@ -19,11 +25,13 @@ FRAME_INTERVAL_MS = 40
 class ModalRelay:
     def __init__(self):
         self._ws = None
+        self._idle_close = None
 
     async def connect(self) -> float | None:
         """Returns how long the handshake took (ms), or None if already connected."""
-        if self._ws is not None:
+        if self._ws is not None and self._ws.state is State.OPEN:
             return None
+        self._ws = None  # closed by us (idle) or by Modal (container stopped)
         t0 = time.perf_counter()
         # open_timeout=600: a cold Modal container can take 40-90s to
         # boot (model loading) before it even accepts the handshake —
@@ -37,9 +45,17 @@ class ModalRelay:
         return ms_since(t0)
 
     async def close(self):
+        if self._idle_close is not None and self._idle_close is not asyncio.current_task():
+            self._idle_close.cancel()
+        self._idle_close = None
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
+
+    async def _close_when_idle(self):
+        await asyncio.sleep(MODAL_IDLE_CLOSE_S)
+        print(f"[modal] no turn for {MODAL_IDLE_CLOSE_S}s, closing the connection so the GPU can scale down")
+        await self.close()
 
     async def ping_ms(self) -> float | None:
         """One websocket ping/pong round trip to Modal = pure network RTT."""
@@ -55,6 +71,15 @@ class ModalRelay:
         callbacks invoked per message, in order. Returns the "done" message's
         stats dict (or None). `metrics`, if given, is filled with the
         backend-side timings (relative to the moment the audio is sent)."""
+        if self._idle_close is not None:
+            self._idle_close.cancel()
+            self._idle_close = None
+        try:
+            return await self._stream(audio_bytes, on_json, on_binary, metrics)
+        finally:
+            self._idle_close = asyncio.create_task(self._close_when_idle())
+
+    async def _stream(self, audio_bytes, on_json, on_binary, metrics):
         m = metrics if metrics is not None else {}
         m["connect_ms"] = await self.connect()  # null => connection reused (warm)
         m["ping_rtt_ms"] = await self.ping_ms()

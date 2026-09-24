@@ -168,6 +168,24 @@ grant microphone access, and go.
 `pkill -INT -f "[v]env/bin/modal serve server.py"`) when you're done, and
 confirm with `modal app list` that no app is left running.
 
+### Deploying (permanent URL, scales to zero)
+
+```bash
+# 1. the GPU lip-sync app (repo root) -> prints ...-musetalkinference-web.modal.run
+modal deploy server.py
+
+# 2. keys for the backend, as a Modal secret. MODAL_WS_URL must be the
+#    step-1 URL (no "-dev") + /ws-stream
+modal secret create interview-backend --from-dotenv interview-poc/backend/.env --force
+
+# 3. the interview backend + frontend (CPU only) -> prints the app URL
+cd interview-poc && modal deploy modal_app.py
+```
+
+Open the URL from step 3. Both apps stop after 3 minutes without an open
+session and cold-start on the next visit (~70 s for the GPU app today).
+Latency logs: `modal volume get interview-latency-logs / ./backend/logs`.
+
 ### Latency logs
 
 Every session writes `interview-poc/backend/logs/session_<time>_<id>.json`

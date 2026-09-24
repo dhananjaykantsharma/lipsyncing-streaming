@@ -42,7 +42,11 @@ def _summ(xs):
     # blend + x264 are CPU-bound; a default container gets very few cores
     cpu=8,
     timeout=3600,
-    scaledown_window=300,
+    # scale to zero: stop the GPU container after 3 min with no open
+    # connection; the next request cold-starts a new one. An open /ws-stream
+    # websocket counts as a running request, so the backend closes its idle
+    # connection too (MODAL_IDLE_CLOSE_S in interview-poc/backend).
+    scaledown_window=180,
 )
 class MuseTalkInference:
 

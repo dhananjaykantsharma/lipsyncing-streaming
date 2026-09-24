@@ -19,7 +19,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOG_DIR = Path(__file__).parent / "logs"
+# LATENCY_LOG_DIR: set on Modal (modal_app.py) to a Volume so logs survive
+# the container scaling down
+LOG_DIR = Path(os.environ.get("LATENCY_LOG_DIR") or Path(__file__).parent / "logs")
 
 
 def _now_iso():
