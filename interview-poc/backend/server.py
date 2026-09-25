@@ -1,8 +1,12 @@
 """Browser-facing WebSocket server + static file server for the POC frontend.
 
 Protocol (browser <-> this server, over one WebSocket at /session):
-  browser -> server   binary: the candidate's recorded answer (one blob, sent
-                       once the "I'm done answering" button is pressed)
+  The candidate's answer is uploaded WHILE they speak, not after:
+  browser -> server   {"type": "answer_start"}                  "Start Answer" clicked
+  browser -> server   binary: WebM/Opus chunk (every 250 ms)    appended to a buffer
+  browser -> server   {"type": "answer_end", "chunks", "bytes"} "Done" -> buffer goes to STT
+  browser -> server   {"type": "answer_cancel"}                 mic failed, drop the buffer
+  (a binary message with no answer_start before it = a whole answer in one blob)
   server  -> browser  {"type": "answer_text", "text": ...}      STT result
   server  -> browser  {"type": "question_text", "text": ...}    next question
   server  -> browser  binary: [0x01][MP3 bytes]                 TTS audio
@@ -56,7 +60,8 @@ async def session_endpoint(websocket: WebSocket):
             if msg["type"] == "websocket.disconnect":
                 raise WebSocketDisconnect(msg.get("code", 1000))
             if msg.get("bytes") is not None:
-                await session.handle_answer(msg["bytes"])
+                if not session.add_answer_chunk(msg["bytes"]):
+                    await session.handle_answer(msg["bytes"])
             elif msg.get("text") is not None:
                 await session.handle_client_message(json.loads(msg["text"]))
     except WebSocketDisconnect:

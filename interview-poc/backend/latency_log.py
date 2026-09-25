@@ -85,7 +85,7 @@ def _flatten(d: dict, prefix: str = "") -> dict:
 
 
 class SessionLog:
-    SUMMARY_SECTIONS = ("timeline_ms", "stt", "llm", "tts", "modal", "modal_server", "network", "client")
+    SUMMARY_SECTIONS = ("timeline_ms", "answer_upload", "stt", "llm", "tts", "modal", "modal_server", "network", "client")
 
     def __init__(self):
         LOG_DIR.mkdir(exist_ok=True)
@@ -106,6 +106,7 @@ class SessionLog:
             "kind": kind,  # "opening" | "answer"
             "started_at": _now_iso(),
             "timeline_ms": {},
+            "answer_upload": {},
             "stt": {},
             "llm": {},
             "tts": {},

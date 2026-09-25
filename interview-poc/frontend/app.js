@@ -1,7 +1,10 @@
 // Interview POC frontend.
 //
 // Protocol (matches backend/server.py):
-//   we send    binary: candidate's recorded answer (one blob, webm/opus)
+//   we send    {"type":"answer_start"}, then binary WebM/Opus chunks every
+//              ANSWER_TIMESLICE_MS while the candidate speaks, then
+//              {"type":"answer_end","chunks","bytes"} on "Done" — so the
+//              answer is already uploaded by the time they click Done
 //   we receive {"type":"answer_text","text":...}          STT result (debug display)
 //   we receive {"type":"question_text","text":...}        next question
 //   we receive binary [0x01][MP3 bytes]                    TTS audio for that question
@@ -34,6 +37,8 @@ const H264_CODEC = "avc1.64001F";
 // 32 kbps the upload is ~4x smaller and Deepgram's transcript was identical
 // (tools/stt_bitrate_test.py: 0% WER vs 128k, confidence 0.999).
 const ANSWER_BITRATE_BPS = 32000;
+// how often the recorder hands over a chunk to upload while recording
+const ANSWER_TIMESLICE_MS = 250;
 
 const TAG_TTS_AUDIO = 0x01;
 const TAG_VIDEO_FRAME = 0x02;
@@ -284,29 +289,37 @@ class TurnPlayer {
 class Recorder {
   constructor() {
     this.mediaRecorder = null;
-    this.chunks = [];
     this.stream = null;
+    this.nChunks = 0;
+    this.nBytes = 0;
   }
 
-  async start() {
+  // onChunk(blob) is called every ANSWER_TIMESLICE_MS while recording, and
+  // once more with the tail when stop() is called
+  async start(onChunk) {
     // mono: the bitrate then goes to one voice channel (as in the bitrate test)
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
     this.mediaRecorder = new MediaRecorder(this.stream, {
       mimeType: "audio/webm;codecs=opus",
       audioBitsPerSecond: ANSWER_BITRATE_BPS,
     });
-    this.chunks = [];
+    this.nChunks = 0;
+    this.nBytes = 0;
     this.mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) this.chunks.push(e.data);
+      if (e.data.size === 0) return;
+      this.nChunks++;
+      this.nBytes += e.data.size;
+      onChunk(e.data);
     };
-    this.mediaRecorder.start();
+    this.mediaRecorder.start(ANSWER_TIMESLICE_MS);
   }
 
+  // resolves after the final chunk has been handed to onChunk
   stop() {
     return new Promise((resolve) => {
       this.mediaRecorder.onstop = () => {
         this.stream.getTracks().forEach((t) => t.stop());
-        resolve(new Blob(this.chunks, { type: "audio/webm" }));
+        resolve();
       };
       this.mediaRecorder.stop();
     });
@@ -455,9 +468,12 @@ async function onStart() {
 
 async function onRecordClick() {
   if (!recording) {
+    ws.send(JSON.stringify({ type: "answer_start" }));
     try {
-      await recorder.start();
+      // each chunk goes straight onto the socket (WebSocket.send keeps order)
+      await recorder.start((blob) => ws.send(blob));
     } catch (e) {
+      ws.send(JSON.stringify({ type: "answer_cancel" }));
       setStatus(`Microphone error: ${e}`);
       return;
     }
@@ -471,21 +487,24 @@ async function onRecordClick() {
     const metrics = newTurnMetrics({
       kind: "answer",
       recording_s: Math.round(performance.now() - recordStartedAt) / 1000,
+      // bytes recorded but not yet sent when Done was clicked (0 => upload kept up)
+      ws_backlog_at_done_bytes: ws.bufferedAmount,
     });
     el.recordBtn.textContent = "Start Answer";
     el.recordBtn.classList.remove("recording");
     el.recordBtn.disabled = true;
     setStatus("Processing your answer...");
     showProcessing();
-    const blob = await recorder.stop();
-    console.log(`recorded answer: ${blob.size} bytes, type=${blob.type}`);
-    const buf = await blob.arrayBuffer();
-    metrics.values.answer_blob_bytes = buf.byteLength;
+    await recorder.stop(); // the tail chunk is on the socket after this
+    const { nChunks, nBytes } = recorder;
+    console.log(`recorded answer: ${nBytes} bytes in ${nChunks} chunks (streamed while recording)`);
+    metrics.values.answer_blob_bytes = nBytes;
+    metrics.values.answer_chunks = nChunks;
     // actual bitrate the browser produced (should be ~32 when the setting is honoured)
-    metrics.values.answer_kbps = Math.round((buf.byteLength * 8) / metrics.values.recording_s / 1000);
+    metrics.values.answer_kbps = Math.round((nBytes * 8) / metrics.values.recording_s / 1000);
     pendingMetrics = metrics;
-    ws.send(buf);
-    markT(metrics, "answer_sent_ms"); // click -> sent = MediaRecorder finalize
+    ws.send(JSON.stringify({ type: "answer_end", chunks: nChunks, bytes: nBytes }));
+    markT(metrics, "answer_sent_ms"); // click -> answer_end sent (tail chunk + recorder finalize)
   }
 }
 

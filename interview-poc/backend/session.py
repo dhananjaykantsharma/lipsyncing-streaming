@@ -24,6 +24,11 @@ class Session:
         self.modal = ModalRelay()
         self.log = SessionLog()
         self._keep_warm = None
+        # answer audio streamed in while the candidate speaks (answer_start ->
+        # binary chunks -> answer_end); None when no answer is being recorded
+        self._answer_chunks: list[bytes] | None = None
+        self._answer_started_at = 0.0
+        self._answer_last_chunk_at = 0.0
         print(f"[session] latency log: {self.log.path}")
 
     async def start(self):
@@ -40,8 +45,36 @@ class Session:
             _derive_network(turn)
             self.log.save()
 
-    async def handle_answer(self, audio_bytes: bytes, content_type: str = "audio/webm"):
+    def add_answer_chunk(self, chunk: bytes) -> bool:
+        """Buffers one streamed chunk. False => no answer_start was seen, so
+        the bytes are a whole answer sent the old (single blob) way."""
+        if self._answer_chunks is None:
+            return False
+        self._answer_chunks.append(chunk)
+        self._answer_last_chunk_at = time.perf_counter()
+        return True
+
+    async def _end_answer(self, data: dict):
+        chunks, self._answer_chunks = self._answer_chunks, None
+        if chunks is None:
+            return
+        now = time.perf_counter()
+        audio = b"".join(chunks)
+        upload = {
+            "streamed": True,
+            "chunks": len(chunks),
+            "bytes": len(audio),
+            # the browser's own count: a mismatch would mean lost chunks
+            "complete": data.get("chunks") == len(chunks) and data.get("bytes") == len(audio),
+            "recording_ms": round((now - self._answer_started_at) * 1000, 1),
+            # ~0 => the upload kept up while the candidate was speaking
+            "last_chunk_to_end_ms": round((now - self._answer_last_chunk_at) * 1000, 1) if chunks else None,
+        }
+        await self.handle_answer(audio, upload=upload)
+
+    async def handle_answer(self, audio_bytes: bytes, content_type: str = "audio/webm", upload: dict | None = None):
         turn = self.log.new_turn("answer")
+        turn["answer_upload"] = upload or {"streamed": False, "bytes": len(audio_bytes)}
         try:
             t = time.perf_counter()
             text = await stt.transcribe(audio_bytes, content_type=content_type, metrics=turn["stt"])
@@ -62,8 +95,15 @@ class Session:
             self.log.save()
 
     async def handle_client_message(self, data: dict):
-        """Browser -> backend control messages (latency reporting)."""
-        if data.get("type") == "ping":
+        """Browser -> backend control messages (answer streaming, latency reporting)."""
+        if data.get("type") == "answer_start":
+            self._answer_chunks = []
+            self._answer_started_at = self._answer_last_chunk_at = time.perf_counter()
+        elif data.get("type") == "answer_cancel":
+            self._answer_chunks = None
+        elif data.get("type") == "answer_end":
+            await self._end_answer(data)
+        elif data.get("type") == "ping":
             await self.send_json({"type": "pong", "id": data.get("id")})
         elif data.get("type") == "client_metrics":
             turn = self.log.turn(data.get("turn"))
