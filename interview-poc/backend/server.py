@@ -74,5 +74,15 @@ async def session_endpoint(websocket: WebSocket):
             pass  # already closed (e.g. client disconnected)
 
 
+@app.middleware("http")
+async def no_cache_frontend(request, call_next):
+    """Make the browser revalidate index.html / app.js on every load (a cheap
+    304 when unchanged). Without it, after a redeploy the browser kept running
+    its cached app.js (a test session ran the old 128 kbps recorder)."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # serve the plain HTML/CSS/JS frontend at http://localhost:8000/
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

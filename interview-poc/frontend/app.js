@@ -30,6 +30,11 @@ const PREBUFFER_S = 0.5;
 // see interview-poc's implementation notes if the avatar resolution changes.
 const H264_CODEC = "avc1.64001F";
 
+// Opus bitrate for the candidate's answer. Chrome's default is ~128 kbps; at
+// 32 kbps the upload is ~4x smaller and Deepgram's transcript was identical
+// (tools/stt_bitrate_test.py: 0% WER vs 128k, confidence 0.999).
+const ANSWER_BITRATE_BPS = 32000;
+
 const TAG_TTS_AUDIO = 0x01;
 const TAG_VIDEO_FRAME = 0x02;
 
@@ -284,8 +289,12 @@ class Recorder {
   }
 
   async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    this.mediaRecorder = new MediaRecorder(this.stream, { mimeType: "audio/webm;codecs=opus" });
+    // mono: the bitrate then goes to one voice channel (as in the bitrate test)
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+    this.mediaRecorder = new MediaRecorder(this.stream, {
+      mimeType: "audio/webm;codecs=opus",
+      audioBitsPerSecond: ANSWER_BITRATE_BPS,
+    });
     this.chunks = [];
     this.mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) this.chunks.push(e.data);
@@ -472,6 +481,8 @@ async function onRecordClick() {
     console.log(`recorded answer: ${blob.size} bytes, type=${blob.type}`);
     const buf = await blob.arrayBuffer();
     metrics.values.answer_blob_bytes = buf.byteLength;
+    // actual bitrate the browser produced (should be ~32 when the setting is honoured)
+    metrics.values.answer_kbps = Math.round((buf.byteLength * 8) / metrics.values.recording_s / 1000);
     pendingMetrics = metrics;
     ws.send(buf);
     markT(metrics, "answer_sent_ms"); // click -> sent = MediaRecorder finalize
